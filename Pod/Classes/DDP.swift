@@ -27,10 +27,6 @@
 //
 
 
-//TODO -> Add manual ping
-//        Fix connect so that it correctly deals with the session
-//      
-
 import Foundation
 import SwiftWebSocket
 import XCGLogger
@@ -43,39 +39,41 @@ public class DDP {
     
     public class Client: NSObject {
         
+        // included for storing login id and token
         let userData = NSUserDefaults.standardUserDefaults()
 
-        var url:String!
-        var socket:WebSocket!
-        var session:String!
-        var test = false
-        var subscriptions = [String:String]()
-        var callbacks:[String:OnComplete?] = [:]
+        private var socket:WebSocket!
+        private var callbacks:[String:OnComplete?] = [:]
+        private var server:(ping:NSDate?, pong:NSDate?) = (nil, nil)
         
-        public var logLevel = XCGLogger.LogLevel.None
+        var url:String!
+        var subscriptions = [String:(id:String, name:String, ready:Bool)]()
+
+        public var logLevel = XCGLogger.LogLevel.Debug
         public var events:Events!
-        public var connected = false
+        public var connection:(ddp:Bool, session:String?) = (false, nil)
+    
         
         public init(url:String) {
             super.init()
             log.setup(logLevel, showLogIdentifier: true, showFunctionName: true, showThreadName: true, showLogLevel: false, showFileNames: false, showLineNumbers: true, showDate: false, writeToFile: nil, fileLogLevel: .None)
             self.url = url
             events = DDP.Events()
-            events.onPing = pong
             socket = WebSocket(url)
             socket.event.close = events.onWebsocketClose
             socket.event.error = events.onWebsocketError
             socket.event.message = { message in
                 if let text = message as? String {
-                    self.ddpMessageHandler(DDP.Message(message: text))
+                    do { try self.ddpMessageHandler(DDP.Message(message: text)) }
+                    catch { log.debug("Message handling error. Raw message: \(text)")}
                 }
             }
         }
         
         // Create the DDP Object and make a basic connection
-        public convenience init(url:String, onConnected:Events.Callbacks.Connected) {
+        public convenience init(url:String, callback:Connected) {
             self.init(url:url)
-            events.onConnected = onConnected
+            events.onConnected = callback
             socket.event.open = {
                 self.connect(nil)
             }
@@ -83,58 +81,62 @@ public class DDP {
         
         private func getId() -> String { return NSUUID().UUIDString }
         
+        // Make a websocket connection to a Meteor server
+        public func connect(callback:Connected?) {
+            if let c = callback { events.onConnected = c }
+            sendMessage(["msg":"connect", "version":"1", "support":["1", "pre2"]])
+        }
+        
         func ping() {
             sendMessage(["msg":"ping", "id":getId()])
         }
         
         // Respond to a server ping
         private func pong(ping: DDP.Message) {
+            server.ping = NSDate()
+            log.debug("Ping")
             var response = ["msg":"pong"]
             if let id = ping.id { response["id"] = id }
             sendMessage(response)
         }
         
         // Parse DDP messages and dispatch to the appropriate function
-        internal func ddpMessageHandler(message: DDP.Message) {
+        internal func ddpMessageHandler(message: DDP.Message) throws {
             log.debug("Received message: \(message.json)")
             switch message.type {
-            case .Connected:
-                session = message.session!
-                connected = true
-                events.onConnected(session:message.session!)
+            case .Connected: connection = (true, message.session!); events.onConnected(session:message.session!)
                 
             case .Result:
                 if let id = message.id {
                     if let callback = callbacks[id] {
                         events.onResult(json: message.json, callback: callback) // Message should have id if it's a result message
+                        callbacks[id] = nil             // Remove the callback from the dictionary
                     } else { log.debug("no callback availble for the id \(id). callbacks are: \(callbacks)") }
                 } else { log.debug("malformed result message: \(message)") }
             
-            case .Updated: events.onUpdated(methods: message.methods!)                         // Updated message should have methods array
-            case .Nosub: events.onNosub(id: message.id!, error: message.error)
-            case .Added: events.onAdded(collection: message.collection!, id: message.id!, fields: message.fields)
-            case .Changed: events.onChanged(collection: message.collection!, id: message.id!, fields: message.fields, cleared: message.cleared)
-            case .Removed: events.onRemoved(collection: message.collection!, id: message.id!)
-            case .Ready: events.onReady(subs: message.subs!)
-            case .Ping: pong(message)
-            case .Pong: log.debug("[DDP] Pong received")
-            
-            // The ordered messages are not currently used by Meteor
-            // case .AddedBefore: events.onAddedBefore(collection: message.collection!, id: message.id!, fields: message.fields!, before: message.before!)
-            // case .MovedBefore: events.onMovedBefore(collection: message.collection!, id: message.id!, before: message.before!)
+            // Principal callbacks for managing data
                 
-            default: log.debug("[DDP] Unhandled message: \(message.json)")
+            case .Added: documentWasAdded(message.collection!, id: message.id!, fields: message.fields)
+            case .Changed: documentWasChanged(message.collection!, id: message.id!, fields: message.fields, cleared: message.cleared)
+            case .Removed: documentWasRemoved(message.collection!, id: message.id!)
+            
+            // Notifies you when the result of a method changes
+            case .Updated: methodWasUpdated(message.methods!)                         // Updated message should have methods array
+
+            // Callbacks for managing subscriptions
+            case .Ready: ready(message.subs!)
+            case .Nosub: nosub(message.id!, error: message.error)
+
+            case .Ping: pong(message)
+            case .Pong: server.pong = NSDate()
+            case .Error: error(message.error!)
+                
+            default: log.debug("Unhandled message: \(message.json)")
             }
         }
         
         private func sendMessage(message:AnyObject) {
             if let m = Message.toString(message) { socket.send(m) }
-        }
-        
-        // Make a websocket connection to a Meteor server
-        public func connect(onConnected:Events.Callbacks.Connected?) {
-            if let callback = onConnected { events.onConnected = callback }
-            sendMessage(["msg":"connect", "version":"1", "support":["1", "pre2"]])
         }
         
         // Execute a method on the Meteor server
@@ -150,20 +152,79 @@ public class DDP {
         // Subscribe to a Meteor collection
         public func sub(name: String, params: NSDictionary?) -> String {
             let id = getId()
-            subscriptions[name] = id
+            subscriptions[id] = (id, name, false)
             let message = ["msg":"sub", "name":name, "id":id] as NSMutableDictionary
             if let p = params { message["params"] = p }
             sendMessage(message)
             return id
         }
         
-        // Unsubscribe to a Meteor collection
-        public func unsub(name: String) -> String? {
-            if let id = subscriptions[name] {
-                sendMessage(["msg":"unsub", "id":id])
-                return name
+        // Iterates over the Dictionary of subscriptions to find a subscription by name
+        func findSubscription(name:String) -> (id:String, name:String, ready:Bool)? {
+            for subscription in subscriptions.values {
+                if (name == subscription.name) {
+                    return subscription
+                }
             }
             return nil
+        }
+        
+        // Unsubscribe to a Meteor collection
+        public func unsub(name: String) -> String? {
+            if let subscription = findSubscription(name) {
+                sendMessage(["msg":"unsub", "id":subscription.id])
+                return subscription.id
+            }
+            return nil
+        }
+        
+        private func ready(subs:[String]) {
+            for id in subs {
+                if var sub = subscriptions[id] {
+                    sub.ready = true
+                    subscriptions[id] = sub
+                    subscriptionIsReady(sub.id, subscriptionName: sub.name)
+                }
+            }
+        }
+        
+        private func nosub(id:String, error:NSDictionary?) {
+            if let e = error {
+                print(e)
+            } else {
+                if let subscription = subscriptions[id] {
+                    subscriptions[id] = nil
+                    subscriptionWasRemoved(subscription.id, subscriptionName: subscription.name)
+                }
+            }
+        }
+        
+        //
+        // public callbacks: should be overridden
+        //
+        
+        public func subscriptionIsReady(subscriptionId:String, subscriptionName:String) {}
+        
+        public func subscriptionWasRemoved(subscriptionId:String, subscriptionName:String) {}
+        
+        public func documentWasAdded(collection:String, id:String, fields:NSDictionary?) {
+            events.onAdded(collection: collection, id: id, fields: fields)
+        }
+        
+        public func documentWasRemoved(collection:String, id:String) {
+            events.onRemoved(collection: collection, id: id)
+        }
+        
+        public func documentWasChanged(collection:String, id:String, fields:NSDictionary?, cleared:[String]?) {
+            events.onChanged(collection:collection, id:id, fields:fields, cleared:cleared)
+        }
+        
+        public func methodWasUpdated(methods:[String]) {
+            events.onUpdated(methods: methods)
+        }
+        
+        public func error(message:NSDictionary) {
+            
         }
     }
 }
